@@ -78,7 +78,6 @@ export interface Note {
   id?: string;
   title?: string;
   body: string;
-  authorId?: string;
 }
 
 export interface SearchOptions {

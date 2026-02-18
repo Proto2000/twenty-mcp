@@ -409,7 +409,6 @@ export function registerTaskTools(server: McpServer, client: TwentyClient) {
     {
       title: z.string().optional().describe('Note title'),
       body: z.string().describe('Note content'),
-      authorId: z.string().optional().describe('ID of the note author'),
     },
     async (args) => {
     try {

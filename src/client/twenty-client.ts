@@ -3,10 +3,10 @@ import { TwentyConfig, Person, Company, Task, Note, SearchOptions } from '../typ
 import { Opportunity, CreateOpportunityInput, UpdateOpportunityInput, SearchOpportunitiesInput } from '../types/opportunities.js';
 import { Activity, Comment, CreateCommentInput, ActivityFilter, EntityActivitiesInput, ActivityTimeline } from '../types/activities.js';
 import { ObjectMetadata, FieldMetadata, ObjectSchema, ObjectSummary, MetadataQueryOptions, FieldQueryOptions } from '../types/metadata.js';
-import { 
-  RelationshipSummary, 
-  CompanyContactsResult, 
-  PersonOpportunitiesResult, 
+import {
+  RelationshipSummary,
+  CompanyContactsResult,
+  PersonOpportunitiesResult,
   OpportunityActivitiesResult,
   RelationshipHierarchy,
   OrphanedRecords,
@@ -17,16 +17,17 @@ import {
 
 export class TwentyClient {
   private client: GraphQLClient;
+  private metadataClient: GraphQLClient;
   private baseUrl: string;
 
   constructor(config: TwentyConfig) {
     this.baseUrl = config.baseUrl || 'https://api.twenty.com';
-    this.client = new GraphQLClient(`${this.baseUrl}/graphql`, {
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-    });
+    const headers = {
+      'Authorization': `Bearer ${config.apiKey}`,
+      'Content-Type': 'application/json',
+    };
+    this.client = new GraphQLClient(`${this.baseUrl}/graphql`, { headers });
+    this.metadataClient = new GraphQLClient(`${this.baseUrl}/metadata`, { headers });
   }
 
   async createPerson(person: Person): Promise<Person> {
@@ -99,7 +100,7 @@ export class TwentyClient {
 
   async updatePerson(id: string, updates: Partial<Person>): Promise<Person> {
     const mutation = `
-      mutation UpdatePerson($id: ID!, $data: PersonUpdateInput!) {
+      mutation UpdatePerson($id: UUID!, $data: PersonUpdateInput!) {
         updatePerson(id: $id, data: $data) {
           id
           name {
@@ -261,7 +262,7 @@ export class TwentyClient {
 
   async updateCompany(id: string, updates: Partial<Company>): Promise<Company> {
     const mutation = `
-      mutation UpdateCompany($id: ID!, $data: CompanyUpdateInput!) {
+      mutation UpdateCompany($id: UUID!, $data: CompanyUpdateInput!) {
         updateCompany(id: $id, data: $data) {
           id
           name
@@ -358,7 +359,9 @@ export class TwentyClient {
         createTask(data: $data) {
           id
           title
-          body
+          bodyV2 {
+            markdown
+          }
           dueAt
           status
           assigneeId
@@ -366,8 +369,19 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(mutation, { data: task }) as { createTask: Task };
-    return result.createTask;
+    // Transform body to bodyV2 for the GraphQL API
+    const { body, ...rest } = task;
+    const data = {
+      ...rest,
+      ...(body !== undefined && { bodyV2: { markdown: body, blocknote: '' } })
+    };
+
+    const result = await this.client.request(mutation, { data }) as { createTask: any };
+    // Map bodyV2 back to body for the caller
+    return {
+      ...result.createTask,
+      body: result.createTask.bodyV2?.markdown
+    };
   }
 
   async getTasks(options: SearchOptions = {}): Promise<Task[]> {
@@ -378,7 +392,9 @@ export class TwentyClient {
             node {
               id
               title
-              body
+              bodyV2 {
+                markdown
+              }
               status
             }
           }
@@ -386,9 +402,12 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(query) as { tasks: { edges: { node: Task }[] } };
+    const result = await this.client.request(query) as { tasks: { edges: { node: any }[] } };
 
-    return result.tasks.edges.map(edge => edge.node);
+    return result.tasks.edges.map(edge => ({
+      ...edge.node,
+      body: edge.node.bodyV2?.markdown
+    }));
   }
 
   async createNote(note: Note): Promise<Note> {
@@ -397,14 +416,25 @@ export class TwentyClient {
         createNote(data: $data) {
           id
           title
-          body
-          authorId
+          bodyV2 {
+            markdown
+          }
         }
       }
     `;
 
-    const result = await this.client.request(mutation, { data: note }) as { createNote: Note };
-    return result.createNote;
+    // Transform body to bodyV2 for the GraphQL API
+    const { body, ...rest } = note;
+    const data = {
+      ...rest,
+      ...(body !== undefined && { bodyV2: { markdown: body, blocknote: '' } })
+    };
+
+    const result = await this.client.request(mutation, { data }) as { createNote: any };
+    return {
+      ...result.createNote,
+      body: result.createNote.bodyV2?.markdown
+    };
   }
 
   async createOpportunity(opportunity: CreateOpportunityInput): Promise<Opportunity> {
@@ -462,7 +492,7 @@ export class TwentyClient {
   async updateOpportunity(input: UpdateOpportunityInput): Promise<Opportunity> {
     const { id, ...data } = input;
     const mutation = `
-      mutation UpdateOpportunity($id: ID!, $data: OpportunityUpdateInput!) {
+      mutation UpdateOpportunity($id: UUID!, $data: OpportunityUpdateInput!) {
         updateOpportunity(id: $id, data: $data) {
           id
           name
@@ -486,8 +516,8 @@ export class TwentyClient {
 
   async searchOpportunities(input: SearchOpportunitiesInput): Promise<Opportunity[]> {
     const query = `
-      query SearchOpportunities($filter: OpportunityFilterInput, $first: Int, $skip: Int) {
-        opportunities(filter: $filter, first: $first, skip: $skip) {
+      query SearchOpportunities($filter: OpportunityFilterInput, $first: Int, $after: String) {
+        opportunities(filter: $filter, first: $first, after: $after) {
           edges {
             node {
               id
@@ -509,25 +539,25 @@ export class TwentyClient {
     `;
 
     const filters: any = {};
-    
+
     if (input.query) {
       filters.name = { ilike: `%${input.query}%` };
     }
-    
+
     if (input.stage) {
       filters.stage = { eq: input.stage };
     }
-    
+
     if (input.companyId) {
       filters.companyId = { eq: input.companyId };
     }
-    
+
     if (input.startDate || input.endDate) {
       filters.closeDate = {};
       if (input.startDate) filters.closeDate.gte = input.startDate;
       if (input.endDate) filters.closeDate.lte = input.endDate;
     }
-    
+
     if (input.minAmount || input.maxAmount) {
       filters.amount = { amountMicros: {} };
       if (input.minAmount) filters.amount.amountMicros.gte = input.minAmount * 1000000;
@@ -537,7 +567,6 @@ export class TwentyClient {
     const result = await this.client.request(query, {
       filter: Object.keys(filters).length > 0 ? filters : undefined,
       first: input.limit || 20,
-      skip: input.offset || 0,
     }) as { opportunities: { edges: { node: Opportunity }[] } };
 
     return result.opportunities.edges.map(edge => edge.node);
@@ -569,7 +598,7 @@ export class TwentyClient {
 
     const result = await this.client.request(query) as { opportunities: { edges: { node: Opportunity }[] } };
     const opportunities = result.opportunities.edges.map(edge => edge.node);
-    
+
     // Group by stage
     const groupedByStage: Record<string, Opportunity[]> = {};
     opportunities.forEach(opp => {
@@ -579,7 +608,7 @@ export class TwentyClient {
       }
       groupedByStage[stage].push(opp);
     });
-    
+
     return groupedByStage;
   }
 
@@ -592,7 +621,9 @@ export class TwentyClient {
             node {
               id
               title
-              body
+              bodyV2 {
+                markdown
+              }
               status
               dueAt
               assigneeId
@@ -618,7 +649,9 @@ export class TwentyClient {
             node {
               id
               title
-              body
+              bodyV2 {
+                markdown
+              }
               createdAt
               updatedAt
             }
@@ -633,7 +666,7 @@ export class TwentyClient {
       this.client.request(tasksQuery, { first: limit }),
       this.client.request(notesQuery, { first: limit })
     ]);
-    
+
     const typedTasksResult = tasksResult as { tasks: { edges: { node: any }[] } };
     const typedNotesResult = notesResult as { notes: { edges: { node: any }[] } };
 
@@ -646,7 +679,7 @@ export class TwentyClient {
         id: task.id,
         type: 'task',
         title: task.title,
-        body: task.body,
+        body: task.bodyV2?.markdown,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
         authorId: task.assigneeId,
@@ -660,7 +693,7 @@ export class TwentyClient {
         id: note.id,
         type: 'note',
         title: note.title,
-        body: note.body,
+        body: note.bodyV2?.markdown,
         createdAt: note.createdAt,
         updatedAt: note.updatedAt,
         authorId: undefined,
@@ -673,23 +706,23 @@ export class TwentyClient {
 
     // Apply filters
     let filteredActivities = activities;
-    
+
     if (filter?.type && filter.type.length > 0) {
       filteredActivities = filteredActivities.filter(activity => filter.type!.includes(activity.type));
     }
-    
+
     if (filter?.dateFrom) {
-      filteredActivities = filteredActivities.filter(activity => 
+      filteredActivities = filteredActivities.filter(activity =>
         new Date(activity.createdAt) >= new Date(filter.dateFrom!)
       );
     }
-    
+
     if (filter?.dateTo) {
-      filteredActivities = filteredActivities.filter(activity => 
+      filteredActivities = filteredActivities.filter(activity =>
         new Date(activity.createdAt) <= new Date(filter.dateTo!)
       );
     }
-    
+
     if (filter?.authorId) {
       filteredActivities = filteredActivities.filter(activity => activity.authorId === filter.authorId);
     }
@@ -707,33 +740,8 @@ export class TwentyClient {
   }
 
   async createComment(input: CreateCommentInput): Promise<Comment> {
-    const mutation = `
-      mutation CreateComment($data: CommentCreateInput!) {
-        createComment(data: $data) {
-          id
-          body
-          authorId
-          author {
-            id
-            name {
-              firstName
-              lastName
-            }
-          }
-          createdAt
-          updatedAt
-        }
-      }
-    `;
-
-    const commentData = {
-      body: input.body,
-      ...(input.authorId && { authorId: input.authorId }),
-      ...(input.activityTargetId && { activityTargetId: input.activityTargetId })
-    };
-
-    const result = await this.client.request(mutation, { data: commentData }) as { createComment: Comment };
-    return result.createComment;
+    // createComment mutation was removed in Twenty CRM v1.17.0
+    throw new Error('createComment is not supported in this version of Twenty CRM. Use createNote instead.');
   }
 
   async getEntityActivities(input: EntityActivitiesInput): Promise<ActivityTimeline> {
@@ -752,7 +760,7 @@ export class TwentyClient {
   async listAllObjects(options: MetadataQueryOptions = {}): Promise<ObjectSummary> {
     const query = `
       query GetObjectMetadata {
-        objects {
+        objects(paging: { first: 200 }) {
           edges {
             node {
               id
@@ -773,20 +781,20 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(query) as { objects: { edges: { node: ObjectMetadata }[] } };
+    const result = await this.metadataClient.request(query) as { objects: { edges: { node: ObjectMetadata }[] } };
     const allObjects = result.objects.edges.map(edge => edge.node);
 
     // Filter based on options
     let filteredObjects = allObjects;
-    
+
     if (options.activeOnly !== false) {
       filteredObjects = filteredObjects.filter(obj => obj.isActive);
     }
-    
+
     if (options.includeCustom === false) {
       filteredObjects = filteredObjects.filter(obj => !obj.isCustom);
     }
-    
+
     if (options.includeSystem === false) {
       filteredObjects = filteredObjects.filter(obj => !obj.isSystem);
     }
@@ -808,112 +816,30 @@ export class TwentyClient {
   }
 
   async getObjectSchema(objectNameOrId: string): Promise<ObjectSchema> {
-    const objectQuery = `
-      query GetObjectSchema($filter: ObjectFilterInput!) {
-        objects(filter: $filter) {
-          edges {
-            node {
-              id
-              nameSingular
-              namePlural
-              labelSingular
-              labelPlural
-              description
-              icon
-              isCustom
-              isActive
-              isSystem
-              createdAt
-              updatedAt
-              fields {
-                edges {
-                  node {
-                    id
-                    name
-                    label
-                    description
-                    type
-                    isCustom
-                    isActive
-                    isNullable
-                    isSystem
-                    defaultValue
-                    createdAt
-                    updatedAt
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    `;
+    // ObjectFilter on /metadata only supports filtering by id, not by nameSingular.
+    // If given a name, we fetch all objects and filter client-side.
+    let objectNode: any;
 
-    // Try to find object by name first, then by ID
-    let filter;
     if (objectNameOrId.match(/^[0-9a-fA-F-]{36}$/)) {
-      // Looks like a UUID
-      filter = { id: { eq: objectNameOrId } };
-    } else {
-      // Assume it's a name
-      filter = { 
-        or: [
-          { nameSingular: { eq: objectNameOrId } },
-          { namePlural: { eq: objectNameOrId } }
-        ]
-      };
-    }
-
-    const result = await this.client.request(objectQuery, { filter }) as { 
-      objects: { 
-        edges: { 
-          node: ObjectMetadata & { 
-            fields: { edges: { node: FieldMetadata }[] } 
-          }
-        }[] 
-      } 
-    };
-
-    if (result.objects.edges.length === 0) {
-      throw new Error(`Object not found: ${objectNameOrId}`);
-    }
-
-    const objectNode = result.objects.edges[0].node;
-    const fields = objectNode.fields.edges.map(edge => edge.node);
-
-    return {
-      object: {
-        id: objectNode.id,
-        nameSingular: objectNode.nameSingular,
-        namePlural: objectNode.namePlural,
-        labelSingular: objectNode.labelSingular,
-        labelPlural: objectNode.labelPlural,
-        description: objectNode.description,
-        icon: objectNode.icon,
-        isCustom: objectNode.isCustom,
-        isActive: objectNode.isActive,
-        isSystem: objectNode.isSystem,
-        createdAt: objectNode.createdAt,
-        updatedAt: objectNode.updatedAt,
-        fields
-      },
-      fields,
-      relationships: [] // TODO: Implement relationship discovery
-    };
-  }
-
-  async getFieldMetadata(options: FieldQueryOptions = {}): Promise<FieldMetadata[]> {
-    let query: string;
-    let variables: any = {};
-
-    if (options.objectId || options.objectName) {
-      // Get fields for a specific object
-      query = `
-        query GetFieldsForObject($filter: ObjectFilterInput!) {
-          objects(filter: $filter) {
+      // UUID: query by id filter
+      const query = `
+        query GetObjectSchema {
+          objects(filter: { id: { eq: "${objectNameOrId}" } }) {
             edges {
               node {
-                fields {
+                id
+                nameSingular
+                namePlural
+                labelSingular
+                labelPlural
+                description
+                icon
+                isCustom
+                isActive
+                isSystem
+                createdAt
+                updatedAt
+                fields(paging: { first: 200 }) {
                   edges {
                     node {
                       id
@@ -937,21 +863,99 @@ export class TwentyClient {
         }
       `;
 
-      if (options.objectId) {
-        variables.filter = { id: { eq: options.objectId } };
-      } else {
-        variables.filter = { 
-          or: [
-            { nameSingular: { eq: options.objectName } },
-            { namePlural: { eq: options.objectName } }
-          ]
-        };
+      const result = await this.metadataClient.request(query) as any;
+      if (result.objects.edges.length === 0) {
+        throw new Error(`Object not found: ${objectNameOrId}`);
       }
+      objectNode = result.objects.edges[0].node;
     } else {
-      // Get all fields across all objects
-      query = `
+      // Name: fetch all objects with fields and filter client-side
+      const query = `
+        query GetAllObjectSchemas {
+          objects(paging: { first: 200 }) {
+            edges {
+              node {
+                id
+                nameSingular
+                namePlural
+                labelSingular
+                labelPlural
+                description
+                icon
+                isCustom
+                isActive
+                isSystem
+                createdAt
+                updatedAt
+                fields(paging: { first: 200 }) {
+                  edges {
+                    node {
+                      id
+                      name
+                      label
+                      description
+                      type
+                      isCustom
+                      isActive
+                      isNullable
+                      isSystem
+                      defaultValue
+                      createdAt
+                      updatedAt
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      const result = await this.metadataClient.request(query) as any;
+      const match = result.objects.edges.find((edge: any) =>
+        edge.node.nameSingular === objectNameOrId || edge.node.namePlural === objectNameOrId
+      );
+      if (!match) {
+        throw new Error(`Object not found: ${objectNameOrId}`);
+      }
+      objectNode = match.node;
+    }
+
+    const fields = objectNode.fields.edges.map((edge: any) => edge.node);
+
+    return {
+      object: {
+        id: objectNode.id,
+        nameSingular: objectNode.nameSingular,
+        namePlural: objectNode.namePlural,
+        labelSingular: objectNode.labelSingular,
+        labelPlural: objectNode.labelPlural,
+        description: objectNode.description,
+        icon: objectNode.icon,
+        isCustom: objectNode.isCustom,
+        isActive: objectNode.isActive,
+        isSystem: objectNode.isSystem,
+        createdAt: objectNode.createdAt,
+        updatedAt: objectNode.updatedAt,
+        fields
+      },
+      fields,
+      relationships: [] // TODO: Implement relationship discovery
+    };
+  }
+
+  async getFieldMetadata(options: FieldQueryOptions = {}): Promise<FieldMetadata[]> {
+    let fields: FieldMetadata[];
+
+    if (options.objectId || options.objectName) {
+      // Get fields for a specific object via getObjectSchema
+      const objectSchema = await this.getObjectSchema(options.objectId || options.objectName!);
+      fields = objectSchema.fields;
+    } else {
+      // Get all fields across all objects from /metadata
+      const query = `
         query GetAllFields {
-          fields {
+          fields(paging: { first: 1000 }) {
             edges {
               node {
                 id
@@ -971,36 +975,26 @@ export class TwentyClient {
           }
         }
       `;
-    }
 
-    const result = await this.client.request(query, variables) as any;
-    
-    let fields: FieldMetadata[];
-    
-    if (options.objectId || options.objectName) {
-      if (result.objects.edges.length === 0) {
-        throw new Error(`Object not found: ${options.objectId || options.objectName}`);
-      }
-      fields = result.objects.edges[0].node.fields.edges.map((edge: any) => edge.node);
-    } else {
+      const result = await this.metadataClient.request(query) as any;
       fields = result.fields.edges.map((edge: any) => edge.node);
     }
 
     // Apply filters
     let filteredFields = fields;
-    
+
     if (options.activeOnly !== false) {
       filteredFields = filteredFields.filter(field => field.isActive);
     }
-    
+
     if (options.includeCustom === false) {
       filteredFields = filteredFields.filter(field => !field.isCustom);
     }
-    
+
     if (options.includeSystem === false) {
       filteredFields = filteredFields.filter(field => !field.isSystem);
     }
-    
+
     if (options.fieldType) {
       filteredFields = filteredFields.filter(field => field.type === options.fieldType);
     }
@@ -1012,7 +1006,7 @@ export class TwentyClient {
 
   async getCompanyContacts(companyId: string): Promise<CompanyContactsResult> {
     const query = `
-      query GetCompanyContacts($companyId: String!) {
+      query GetCompanyContacts($companyId: UUID!) {
         company(filter: { id: { eq: $companyId } }) {
           id
           name
@@ -1040,7 +1034,7 @@ export class TwentyClient {
     `;
 
     const result = await this.client.request(query, { companyId }) as any;
-    
+
     const contacts = result.people.edges.map((edge: any) => ({
       id: edge.node.id,
       name: edge.node.name,
@@ -1060,7 +1054,7 @@ export class TwentyClient {
 
   async getPersonOpportunities(personId: string): Promise<PersonOpportunitiesResult> {
     const query = `
-      query GetPersonOpportunities($personId: String!) {
+      query GetPersonOpportunities($personId: UUID!) {
         person(filter: { id: { eq: $personId } }) {
           id
           name {
@@ -1092,7 +1086,7 @@ export class TwentyClient {
     `;
 
     const result = await this.client.request(query, { personId }) as any;
-    
+
     const opportunities = result.opportunities.edges.map((edge: any) => edge.node);
     const person = result.person;
 
@@ -1106,7 +1100,7 @@ export class TwentyClient {
 
   async linkOpportunityToCompany(input: LinkOpportunityInput): Promise<any> {
     const mutation = `
-      mutation LinkOpportunity($id: String!, $data: OpportunityUpdateInput!) {
+      mutation LinkOpportunity($id: UUID!, $data: OpportunityUpdateInput!) {
         updateOpportunity(id: $id, data: $data) {
           id
           name
@@ -1141,7 +1135,7 @@ export class TwentyClient {
 
   async transferContactToCompany(input: TransferContactInput): Promise<any> {
     const mutation = `
-      mutation TransferContact($id: String!, $data: PersonUpdateInput!) {
+      mutation TransferContact($id: UUID!, $data: PersonUpdateInput!) {
         updatePerson(id: $id, data: $data) {
           id
           name {
@@ -1180,17 +1174,17 @@ export class TwentyClient {
           // Get contacts for this company
           const companyContacts = await this.getCompanyContacts(entityId);
           counts.contacts = companyContacts.totalContacts;
-          
+
           // Get opportunities for this company
           const companyOpps = await this.searchOpportunities({ companyId: entityId, limit: 1000 });
           counts.opportunities = companyOpps.length;
           break;
-          
+
         case 'person':
           // Get opportunities for this person
           const personOpps = await this.getPersonOpportunities(entityId);
           counts.opportunities = personOpps.totalOpportunities;
-          
+
           // Get tasks assigned to this person (would need a specific query for filtering)
           // For now, we'll skip task counting as it requires a filtered query
           counts.tasks = 0;
@@ -1247,10 +1241,10 @@ export class TwentyClient {
           opportunityCount: company.opportunities.totalCount
         }));
 
-      // Find contacts without companies
+      // Find contacts without companies (use FilterIs enum via variable)
       const contactsQuery = `
-        query GetContactsWithoutCompanies {
-          people(filter: { companyId: { is: "NULL" } }, first: 1000) {
+        query GetContactsWithoutCompanies($is: FilterIs!) {
+          people(filter: { companyId: { is: $is } }, first: 1000) {
             edges {
               node {
                 id
@@ -1268,7 +1262,7 @@ export class TwentyClient {
         }
       `;
 
-      const contactsResult = await this.client.request(contactsQuery) as any;
+      const contactsResult = await this.client.request(contactsQuery, { is: 'NULL' }) as any;
       orphaned.contacts = contactsResult.people.edges.map((edge: any) => ({
         id: edge.node.id,
         name: `${edge.node.name.firstName} ${edge.node.name.lastName}`,
